@@ -1,0 +1,17 @@
+name: History safety checks
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  test:
+    strategy:
+      matrix:
+        os: [windows-latest, ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Test with synthetic history files
+        shell: pwsh
+        run: pwsh -NoProfile -File ./tests/Run-Tests.ps1

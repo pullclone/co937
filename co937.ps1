@@ -71,7 +71,9 @@ function Show-PSReadLineHistoryFile {
         [switch] $Open,
 
         [Parameter(ParameterSetName = 'Path')]
-        [switch] $Path
+        [switch] $Path,
+
+        [switch] $IgnoreCase
     )
 
     $historyPath = Get-Co937PSReadLineHistoryPath
@@ -88,7 +90,15 @@ function Show-PSReadLineHistoryFile {
 
     switch ($PSCmdlet.ParameterSetName) {
         'Contains' {
-            Select-String -LiteralPath $historyPath -SimpleMatch -Pattern $Contains
+            $content = [IO.File]::ReadAllText($historyPath, [Text.UTF8Encoding]::new($false, $true))
+            foreach ($entry in @(Read-Co937HistorySnapshot -Content $content)) {
+                if (Test-Co937HistoryLineMatch -Line $entry.Text -Mode Contains -Pattern $Contains -IgnoreCase:$IgnoreCase) {
+                    $match = $entry.Text | Select-String -SimpleMatch -Pattern $Contains -CaseSensitive:(-not $IgnoreCase)
+                    $match.LineNumber = $entry.LineNumber
+                    $match.Path = $historyPath
+                    $match
+                }
+            }
             return
         }
 
@@ -124,162 +134,184 @@ function Show-PSReadLineHistoryFile {
     }
 }
 
+
+function Read-Co937HistorySnapshot {
+    param([AllowEmptyString()][string] $Content)
+    $entries = [Collections.Generic.List[object]]::new()
+    $raw = ''; $text = ''; $start = 1; $number = 0
+    foreach ($match in [regex]::Matches($Content, '([^\r\n]*)(\r\n|\n|\r|$)')) {
+        if ($match.Length -eq 0) { continue }
+        $number++; $line = $match.Groups[1].Value; $raw += $match.Value
+        if ($line.EndsWith([string][char]96, [StringComparison]::Ordinal)) {
+            $text += $line.Substring(0, $line.Length - 1) + [char]10
+        } else {
+            $text += $line
+            $entries.Add([pscustomobject]@{ LineNumber = $start; Text = $text; Raw = $raw })
+            $raw = ''; $text = ''; $start = $number + 1
+        }
+    }
+    if ($raw.Length -gt 0) { throw 'History ends in an incomplete multiline entry. No changes were made.' }
+    $entries.ToArray()
+}
+
 function Test-Co937HistoryLineMatch {
-    [CmdletBinding()]
-    param(
-        [Parameter(Mandatory)]
-        [AllowEmptyString()]
-        [string] $Line,
+    param([AllowEmptyString()][string] $Line, [ValidateSet('Exact','Contains')][string] $Mode,
+        [string] $Pattern, [switch] $IgnoreCase)
+    $comparison = [StringComparison]::Ordinal
+    if ($IgnoreCase) { $comparison = [StringComparison]::OrdinalIgnoreCase }
+    $Pattern = $Pattern.Replace([string][char]13 + [char]10, [string][char]10)
+    if ($Mode -eq 'Exact') { return [string]::Equals($Line, $Pattern, $comparison) }
+    return $Line.IndexOf($Pattern, $comparison) -ge 0
+}
 
-        [Parameter(Mandatory)]
-        [ValidateSet('Exact', 'Contains')]
-        [string] $Mode,
-
-        [Parameter(Mandatory)]
-        [string] $Pattern
-    )
-
-    switch ($Mode) {
-        'Exact' {
-            return [string]::Equals($Line, $Pattern, [System.StringComparison]::Ordinal)
+function Test-Co937HistoryToolCommand {
+    param([AllowEmptyString()][string] $Line)
+    $tokens = $null; $parseErrors = $null
+    $ast = [Management.Automation.Language.Parser]::ParseInput($Line, [ref]$tokens, [ref]$parseErrors)
+    $names = @('shiplog','co937','pshist','hforget','Show-PSReadLineHistoryFile','Remove-PSReadLineHistoryLine')
+    foreach ($command in $ast.FindAll({
+        param($node)
+        $node -is [Management.Automation.Language.CommandAst]
+    }, $true)) {
+        $commandName = $command.GetCommandName()
+        if ($null -ne $commandName -and ($commandName.Split('\')[-1] -in $names)) { return $true }
+    }
+    if ($parseErrors.Count -gt 0) {
+        foreach ($token in $tokens) {
+            if ($token.Text.Trim("'""") -in $names) { return $true }
         }
+    }
+    return $false
+}
 
-        'Contains' {
-            return $Line.Contains($Pattern)
+function Invoke-Co937PreviousHistoryHandler {
+    param($Handler, [string] $Line)
+    if ($null -eq $Handler) { return $true }
+    if ($Handler -is [scriptblock]) { return & $Handler $Line }
+    return $Handler.Invoke($Line)
+}
+
+function Get-Co937HistoryMutexName {
+    param([string] $Path)
+    if (Test-Co937IsWindows) { $Path = $Path.ToLower() }
+    # Matches PSReadLine's FNV-1a hash of both bytes of each UTF-16 character.
+    [ulong] $hash = 2166136261
+    foreach ($byte in [Text.Encoding]::Unicode.GetBytes($Path)) {
+        $hash = (($hash -bxor [ulong]$byte) * 16777619) -band 4294967295
+    }
+    'PSReadLineHistoryFile_' + $hash.ToString()
+}
+
+function Write-Co937HistoryAtomically {
+    param([string] $Path, [AllowEmptyString()][string] $Content)
+    $temporaryPath = Join-Path ([IO.Path]::GetDirectoryName($Path)) ('.co937-' + [guid]::NewGuid().ToString('N') + '.tmp')
+    $stream = $null
+    try {
+        # Copy permissions before writing retained history. Removed entries never enter the temporary file.
+        if (Test-Co937IsWindows) {
+            $acl = Get-Acl -LiteralPath $Path -ErrorAction Stop
+            $accessRules = [Security.AccessControl.FileSecurity]::new()
+            $accessRules.SetSecurityDescriptorSddlForm(
+                $acl.GetSecurityDescriptorSddlForm([Security.AccessControl.AccessControlSections]::Access),
+                [Security.AccessControl.AccessControlSections]::Access)
+            $stream = [IO.FileSystemAclExtensions]::Create(
+                [IO.FileInfo]::new($temporaryPath), [IO.FileMode]::CreateNew,
+                [Security.AccessControl.FileSystemRights]::Write, [IO.FileShare]::None,
+                4096, [IO.FileOptions]::None, $accessRules)
+        } else {
+            $stream = [IO.File]::Open($temporaryPath, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+            [IO.File]::SetUnixFileMode($temporaryPath, [IO.File]::GetUnixFileMode($Path))
         }
+        $bytes = [Text.UTF8Encoding]::new($false, $true).GetBytes($Content)
+        $stream.Write($bytes, 0, $bytes.Length)
+        $stream.Flush($true)
+        $stream.Dispose(); $stream = $null
+        [IO.File]::Replace($temporaryPath, $Path, [Management.Automation.Language.NullString]::Value)
+    } finally {
+        if ($null -ne $stream) { $stream.Dispose() }
+        if ([IO.File]::Exists($temporaryPath)) { [IO.File]::Delete($temporaryPath) }
     }
 }
 
 function Remove-PSReadLineHistoryLine {
-    [CmdletBinding(
-        SupportsShouldProcess = $true,
-        ConfirmImpact = 'High',
-        DefaultParameterSetName = 'Contains'
-    )]
+    [CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'High', DefaultParameterSetName = 'Contains')]
     param(
-        [Parameter(Mandatory, Position = 0, ParameterSetName = 'Contains')]
-        [string] $Contains,
-
-        [Parameter(Mandatory, Position = 0, ParameterSetName = 'Exact')]
-        [string] $Exact,
-
-        [ValidateRange(1, [int]::MaxValue)]
-        [int] $PreviewLimit = 20,
-
-        [switch] $Force
+        [Parameter(Mandatory, Position = 0, ParameterSetName = 'Contains')][string] $Contains,
+        [Parameter(Mandatory, Position = 0, ParameterSetName = 'Exact')][string] $Exact,
+        [ValidateRange(1, [int]::MaxValue)][int] $PreviewLimit = 20,
+        [switch] $Force, [switch] $IgnoreCase, [switch] $ShowSensitivePreview
     )
-
     $historyPath = Get-Co937PSReadLineHistoryPath
-
-    if (-not (Test-Path -LiteralPath $historyPath)) {
+    if (-not [IO.File]::Exists($historyPath)) {
         Write-Warning "PSReadLine history file does not exist: $historyPath"
         return
     }
-
-    $mode = $PSCmdlet.ParameterSetName
-
-    if ($mode -eq 'Exact') {
-        $pattern = $Exact
-        $description = "exact line"
+    $historyPath = [IO.Path]::GetFullPath($historyPath)
+    if (([IO.File]::GetAttributes($historyPath) -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw 'Refusing to replace a symbolic-link history file. Use a regular HistorySavePath.'
     }
-    else {
-        $pattern = $Contains
-        $description = "line containing literal text"
+    if (([IO.File]::GetAttributes($historyPath) -band [IO.FileAttributes]::ReadOnly) -ne 0) {
+        throw 'History file is read-only. No changes were made.'
     }
-
-    $initialLines = [System.IO.File]::ReadAllLines(
-        $historyPath,
-        [System.Text.Encoding]::UTF8
-    )
-
-    $initialMatches = @(
-        for ($i = 0; $i -lt $initialLines.Count; $i++) {
-            if (Test-Co937HistoryLineMatch -Line $initialLines[$i] -Mode $mode -Pattern $pattern) {
-                [pscustomobject]@{
-                    LineNumber = $i + 1
-                    Line       = $initialLines[$i]
-                }
-            }
+    $mode = $PSCmdlet.ParameterSetName; $pattern = $Contains
+    if ($mode -eq 'Exact') { $pattern = $Exact }
+    $encoding = [Text.UTF8Encoding]::new($false, $true)
+    $initialContent = [IO.File]::ReadAllText($historyPath, $encoding)
+    $entries = @(Read-Co937HistorySnapshot -Content $initialContent)
+    $matches = @($entries | Where-Object {
+        Test-Co937HistoryLineMatch -Line $_.Text -Mode $mode -Pattern $pattern -IgnoreCase:$IgnoreCase
+    })
+    if ($matches.Count -eq 0) { Write-Host 'No matching PSReadLine history entries found.'; return }
+    Write-Host "Matching PSReadLine history entries: $($matches.Count)"
+    foreach ($match in ($matches | Select-Object -First $PreviewLimit)) {
+        if ($ShowSensitivePreview) { Write-Host ("[{0}] {1}" -f $match.LineNumber, $match.Text) }
+        else { Write-Host ("[{0}] [content hidden; use -ShowSensitivePreview to display]" -f $match.LineNumber) }
+    }
+    if ($matches.Count -gt $PreviewLimit) { Write-Host "... plus $($matches.Count - $PreviewLimit) additional match(es)." }
+    Write-Warning 'No backup file will be created. Current session PSReadLine history will be cleared after removal.'
+    if (-not $PSCmdlet.ShouldProcess($historyPath, "Remove $($matches.Count) matching PSReadLine history entries")) { return }
+    if (-not $Force -and (Read-Host 'Type DELETE to permanently remove the matching history entries') -cne 'DELETE') {
+        Write-Host 'Aborted. No history entries were removed.'; return
+    }
+    $mutex = [Threading.Mutex]::new($false, (Get-Co937HistoryMutexName -Path $historyPath))
+    $acquired = $false; $historyStream = $null; $reader = $null
+    try {
+        try { $acquired = $mutex.WaitOne(5000) }
+        catch [Threading.AbandonedMutexException] { $acquired = $true }
+        if (-not $acquired) { throw 'History is busy. No changes were made; retry when other sessions are idle.' }
+        if (([IO.File]::GetAttributes($historyPath) -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw 'History path became a symbolic link. No changes were made.'
         }
-    )
-
-    if ($initialMatches.Count -eq 0) {
-        Write-Host "No matching PSReadLine history entries found."
-        return
-    }
-
-    Write-Host ""
-    Write-Host "Matching PSReadLine history entries:"
-    Write-Host ""
-
-    foreach ($match in ($initialMatches | Select-Object -First $PreviewLimit)) {
-        Write-Host ("[{0}] {1}" -f $match.LineNumber, $match.Line)
-    }
-
-    if ($initialMatches.Count -gt $PreviewLimit) {
-        Write-Host ""
-        Write-Host "... plus $($initialMatches.Count - $PreviewLimit) additional match(es)."
-    }
-
-    Write-Host ""
-    Write-Warning "No backup file will be created. This avoids preserving sensitive history elsewhere."
-    Write-Warning "If removal proceeds, this session's PSReadLine in-memory history will also be cleared."
-
-    $action = "Remove $($initialMatches.Count) matching PSReadLine history entr$(if ($initialMatches.Count -eq 1) { 'y' } else { 'ies' })"
-    $target = $historyPath
-
-    if (-not $PSCmdlet.ShouldProcess($target, $action)) {
-        return
-    }
-
-    if (-not $Force) {
-        Write-Host ""
-        $confirmation = Read-Host "Type DELETE to permanently remove the matching history entries"
-
-        if ($confirmation -cne 'DELETE') {
-            Write-Host "Aborted. No history entries were removed."
-            return
+        if (([IO.File]::GetAttributes($historyPath) -band [IO.FileAttributes]::ReadOnly) -ne 0) {
+            throw 'History file became read-only. No changes were made.'
         }
-    }
-
-    # Re-read immediately before writing to reduce, but not eliminate, race risk with other sessions.
-    $latestLines = [System.IO.File]::ReadAllLines(
-        $historyPath,
-        [System.Text.Encoding]::UTF8
-    )
-
-    $keptLines = [string[]] @(
-        for ($i = 0; $i -lt $latestLines.Count; $i++) {
-            if (-not (Test-Co937HistoryLineMatch -Line $latestLines[$i] -Mode $mode -Pattern $pattern)) {
-                $latestLines[$i]
-            }
+        # Exclude writes during validation; the PSReadLine mutex covers replacement.
+        $historyStream = [IO.File]::Open($historyPath, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read -bor [IO.FileShare]::Delete)
+        $reader = [IO.StreamReader]::new($historyStream, $encoding, $true)
+        $latestContent = $reader.ReadToEnd()
+        if (-not [string]::Equals($initialContent, $latestContent, [StringComparison]::Ordinal)) {
+            throw 'History changed after preview. No changes were made; run the command again to review the new history.'
         }
-    )
-
-    $removedCount = $latestLines.Count - $keptLines.Count
-
-    if ($removedCount -eq 0) {
-        Write-Host "No matching entries remained at write time. Nothing was changed."
-        return
+        $kept = @($entries | Where-Object {
+            -not (Test-Co937HistoryLineMatch -Line $_.Text -Mode $mode -Pattern $pattern -IgnoreCase:$IgnoreCase)
+        })
+        $newContent = ($kept | ForEach-Object { $_.Raw }) -join ''
+        $reader.Dispose(); $reader = $null; $historyStream = $null
+        Write-Co937HistoryAtomically -Path $historyPath -Content $newContent
+    } finally {
+        if ($null -ne $reader) { $reader.Dispose() }
+        elseif ($null -ne $historyStream) { $historyStream.Dispose() }
+        if ($acquired) { $mutex.ReleaseMutex() }
+        $mutex.Dispose()
     }
-
-    $utf8NoBom = New-Object System.Text.UTF8Encoding $false
-
-    [System.IO.File]::WriteAllLines(
-        $historyPath,
-        $keptLines,
-        $utf8NoBom
-    )
-
+    $memoryCleared = $false
     try {
         [Microsoft.PowerShell.PSConsoleReadLine]::ClearHistory()
-        Write-Warning "Current session PSReadLine in-memory history was cleared."
-    }
-    catch {
-        Write-Verbose "Unable to clear current PSReadLine in-memory history: $($_.Exception.Message)"
-    }
-
-    Write-Host "Removed $removedCount matching PSReadLine history entr$(if ($removedCount -eq 1) { 'y' } else { 'ies' })."
+        $memoryCleared = $true
+        Write-Warning 'Current session PSReadLine in-memory history was cleared.'
+    } catch { Write-Warning 'File entries were removed, but current PSReadLine memory could not be cleared. Restart this shell.' }
+    Write-Host "Removed $($matches.Count) matching PSReadLine history entries."
+    [pscustomobject]@{ HistoryPath = $historyPath; RemovedCount = $matches.Count; MemoryCleared = $memoryCleared }
 }
 
 function Set-Co937ToolAlias {
@@ -315,32 +347,40 @@ Set-Co937ToolAlias -Name hforget -Value Remove-PSReadLineHistoryLine
 # This is intentionally broad enough to catch the aliases and the full function names.
 # The sentinel prevents repeatedly wrapping a previous handler during profile reloads.
 try {
-    $global:Co937HistoryToolBlockedCommandPattern =
-        '^\s*(?:&\s*)?(?:shiplog|co937|pshist|hforget|Show-PSReadLineHistoryFile|Remove-PSReadLineHistoryLine)\b'
 
-    if (-not (Get-Variable -Scope Global -Name Co937HistoryToolHandlerInstalled -ErrorAction SilentlyContinue)) {
-        $global:Co937HistoryToolPreviousAddToHistoryHandler = (Get-PSReadLineOption).AddToHistoryHandler
-        $global:Co937HistoryToolHandlerInstalled = $true
+    $currentHandler = (Get-PSReadLineOption).AddToHistoryHandler
+    $installedHandler = Get-Variable -Scope Global -Name Co937HistoryToolInstalledHandler -ValueOnly -ErrorAction SilentlyContinue
+    $legacyInstalled = Get-Variable -Scope Global -Name Co937HistoryToolHandlerInstalled -ValueOnly -ErrorAction SilentlyContinue
+    # Preserve the saved delegate when upgrading an already-loaded original helper.
+    if (-not [object]::ReferenceEquals($currentHandler, $installedHandler) -and
+        -not ($legacyInstalled -and $null -eq $installedHandler)) {
+        $global:Co937HistoryToolPreviousAddToHistoryHandler = $currentHandler
     }
 
     Set-PSReadLineOption -AddToHistoryHandler {
         param([string] $line)
 
-        if ($line -match $global:Co937HistoryToolBlockedCommandPattern) {
+        if (Test-Co937HistoryToolCommand -Line $line) {
             return $false
         }
 
         $previousHandler = $global:Co937HistoryToolPreviousAddToHistoryHandler
 
         if ($null -ne $previousHandler) {
-            return & $previousHandler $line
+            try { return Invoke-Co937PreviousHistoryHandler -Handler $previousHandler -Line $line }
+            catch {
+                Write-Warning 'The previous history handler failed. This command will not be added to history.'
+                return $false
+            }
         }
 
         return $true
     }
+    $global:Co937HistoryToolHandlerInstalled = $true
+    $global:Co937HistoryToolInstalledHandler = (Get-PSReadLineOption).AddToHistoryHandler
 }
 catch {
-    Write-Verbose "Unable to install PSReadLine AddToHistoryHandler: $($_.Exception.Message)"
+    Write-Warning "Unable to install co937 history protection: $($_.Exception.Message)"
 }
 
 # Safety key binding:
@@ -382,5 +422,5 @@ try {
     }
 }
 catch {
-    Write-Verbose "Unable to install PSReadLine key binding: $($_.Exception.Message)"
+    Write-Warning "Unable to install co937 safety key binding: $($_.Exception.Message)"
 }

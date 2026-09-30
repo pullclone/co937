@@ -23,25 +23,27 @@ The tool executes shell hygiene tasks such as removing accidental secrets, token
 
 - Uses the active PSReadLine history file from `(Get-PSReadLineOption).HistorySavePath`
 - Shows recent history entries
-- Searches history using literal text matching
+- Searches complete history entries using case-sensitive literal text matching; `-IgnoreCase` is available
 - Opens the history file in a platform-appropriate editor/viewer
-- Removes entries by exact line or literal substring match
-- Previews matching entries before deletion
+- Removes complete entries, including multiline commands, by exact command or literal substring match
+- Previews matching entry locations before deletion; contents are hidden unless `-ShowSensitivePreview` is supplied
 - Creates no backup files, to avoid preserving sensitive values elsewhere
 - Deletes matching lines instead of commenting them out
 - Supports `-WhatIf` and `-Confirm`
 - Requires typing `DELETE` before removal unless `-Force` is used
-- Re-reads the history file immediately before writing to reduce race-condition risk
+- Uses PSReadLine's history-file mutex and aborts if history changes after the preview
+- Atomically replaces the history file with retained entries while preserving access permissions
 - Clears the current session's PSReadLine in-memory history after removal
-- Blocks the helper commands themselves from being saved to PSReadLine history
+- Blocks statically named helper commands, including quoted and compound invocations, from being saved to PSReadLine history
+- Preserves existing history-handler decisions and suppresses history recording if that handler fails
 - Adds a `Ctrl+Alt+H` key binding to prepare a safe exact-removal command for the current buffer
 
 ## Requirements
 
-- PowerShell 7+ recommended
+- PowerShell 7.3+ with PSReadLine
 - PSReadLine available in the session
 
-This may also work in Windows PowerShell 5.1, but PowerShell 7+ is the primary target.
+Windows PowerShell 5.1 is not supported by the atomic writer. Use a regular UTF-8 history file; symbolic-link paths and read-only files are refused. The filesystem must support atomic file replacement.
 
 ## Installation
 
@@ -50,7 +52,7 @@ Clone or create the repository somewhere stable, for example:
 ```bash
 mkdir -p ~/Dev
 cd ~/Dev
-git clone <your-repo-url> co937
+git clone https://github.com/pullclone/co937.git co937
 ```
 
 If you are creating it locally instead of cloning:
@@ -69,29 +71,24 @@ Place `co937.ps1` in the repo:
 
 Then add it to your PowerShell profile.
 
-From Bash or another shell:
+From PowerShell:
 
-```bash
-pwsh -NoProfile -Command '
+```powershell
+$scriptPath = Join-Path $HOME 'Dev/co937/co937.ps1'
+if (-not (Test-Path -LiteralPath $scriptPath -PathType Leaf)) {
+    throw "co937.ps1 was not found: $scriptPath"
+}
+
 $profileDir = Split-Path -Parent $PROFILE
-
-if (-not (Test-Path -LiteralPath $profileDir)) {
-    New-Item -ItemType Directory -Force -Path $profileDir | Out-Null
-}
-
+New-Item -ItemType Directory -Force -Path $profileDir | Out-Null
 if (-not (Test-Path -LiteralPath $PROFILE)) {
-    New-Item -ItemType File -Force -Path $PROFILE | Out-Null
+    New-Item -ItemType File -Path $PROFILE | Out-Null
 }
 
-$line = ". ''$HOME/Dev/co937/co937.ps1''"
-
-if (-not (Select-String -LiteralPath $PROFILE -SimpleMatch -Pattern $line -Quiet -ErrorAction SilentlyContinue)) {
-    Add-Content -LiteralPath $PROFILE -Value $line
+$loader = ". '" + $scriptPath.Replace("'", "''") + "'"
+if (-not (Select-String -LiteralPath $PROFILE -SimpleMatch -Pattern $loader -Quiet)) {
+    Add-Content -LiteralPath $PROFILE -Value $loader -Encoding utf8
 }
-
-Write-Host "Added co937 loader to profile:"
-Write-Host $PROFILE
-'
 ```
 
 Restart PowerShell, or dot-source it immediately:
@@ -132,6 +129,13 @@ Search the history file using literal text:
 shiplog -Contains "token"
 ```
 
+Search and removal are case-sensitive by default. To match different capitalization, use `-IgnoreCase` on either command:
+
+```powershell
+shiplog -Contains "token" -IgnoreCase
+co937 -Contains "token" -IgnoreCase -WhatIf
+```
+
 Open the history file:
 
 ```powershell
@@ -155,6 +159,16 @@ Preview what would happen without writing changes:
 ```powershell
 co937 -Contains "token" -WhatIf
 ```
+
+Removal previews show entry locations and counts without printing command contents. If you need to inspect the contents, opt in explicitly:
+
+```powershell
+co937 -Contains "token" -ShowSensitivePreview -WhatIf
+```
+
+Displayed contents can be captured by terminal logging or transcripts. Inspection commands such as `shiplog` intentionally display history contents.
+
+Successful removal also returns an object containing `HistoryPath`, `RemovedCount`, and `MemoryCleared`. Failed writes do not report success or clear memory.
 
 Skip the extra `DELETE` prompt:
 
@@ -202,7 +216,23 @@ This means your current session's up-arrow history may be wiped.
 
 Other open PowerShell sessions may still have the removed entries in memory or may write to the same history file later. Close or restart other sessions after removing sensitive entries.
 
-The tool re-reads the history file immediately before writing, but race conditions are still possible if multiple shells are writing to the PSReadLine history file at the same time.
+The tool uses the same named mutex as supported PSReadLine versions, waits up to five seconds for it, and compares the current history with the previewed contents. If history changed, it aborts without removing anything; run the command again to review the new entries. This coordinates cooperating PSReadLine writers, but external editors and other writers that ignore the mutex can still race. Close other shells when removing sensitive entries.
+
+Atomic replacement uses a temporary file in the history directory containing only retained entries. It receives the history file's access permissions before any contents are written and is deleted on ordinary failure. No backup or copy of removed entries is created. A process crash can leave a temporary file containing retained history; atomic replacement is not a guarantee of physical erasure from disk, snapshots, or backups.
+
+The history filter recognizes statically named commands in PowerShell syntax. Dynamically resolved invocations, such as a helper name stored in a variable, and new user-defined aliases are outside that protection. Use the provided names directly, or use `Ctrl+Alt+H`, when a removal argument contains sensitive text.
+
+Initialization failures and unsuccessful PSReadLine memory cleanup produce visible warnings. PSReadLine history is separate from PowerShell's `Get-History` session history and from transcripts; this helper does not clear those stores.
+
+## Verification
+
+Run the regression suite in a separate process:
+
+```powershell
+pwsh -NoProfile -File ./tests/Run-Tests.ps1
+```
+
+The suite uses synthetic files in its own temporary directory and mocks profile integration. It does not read or change your real history or profile. GitHub Actions runs the suite on Windows, Linux, and macOS.
 
 ## License
 
