@@ -229,7 +229,13 @@ function Write-Co937HistoryAtomically {
         $stream.Write($bytes, 0, $bytes.Length)
         $stream.Flush($true)
         $stream.Dispose(); $stream = $null
-        [IO.File]::Replace($temporaryPath, $Path, [Management.Automation.Language.NullString]::Value)
+        if (Test-Co937IsWindows) {
+            # ReplaceFile merges DACLs and can turn inherited rules into explicit duplicates.
+            # A same-directory overwrite rename retains the temporary file's restored DACL.
+            [IO.File]::Move($temporaryPath, $Path, $true)
+        } else {
+            [IO.File]::Replace($temporaryPath, $Path, [Management.Automation.Language.NullString]::Value)
+        }
     } finally {
         if ($null -ne $stream) { $stream.Dispose() }
         if ([IO.File]::Exists($temporaryPath)) { [IO.File]::Delete($temporaryPath) }
