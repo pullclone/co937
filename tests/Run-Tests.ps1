@@ -17,6 +17,17 @@ function Set-PSReadLineKeyHandler { param($Chord, $BriefDescription, $LongDescri
 function Read-Host { param($Prompt) if ($script:changeDuringConfirmation) { [IO.File]::AppendAllText($script:historyPath, "new entry`n") }; return $script:confirmation }
 function Set-Fixture([string] $Content) { [IO.File]::WriteAllText($script:historyPath, $Content, [Text.UTF8Encoding]::new($false)) }
 function Get-Fixture { [IO.File]::ReadAllText($script:historyPath) }
+function Get-FixturePermissions {
+    if (-not (Test-Co937IsWindows)) { return [IO.File]::GetUnixFileMode($script:historyPath) }
+    $acl = Get-Acl -LiteralPath $script:historyPath
+    # Windows replacement can normalize DACL control flags (for example D:P to D:PAI).
+    # Compare every access rule and inheritance protection, rather than the SDDL spelling.
+    $rules = @($acl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier]) | ForEach-Object {
+        '{0}|{1}|{2}|{3}|{4}|{5}' -f $_.IdentityReference.Value, [int]$_.FileSystemRights,
+            $_.AccessControlType, $_.InheritanceFlags, $_.PropagationFlags, $_.IsInherited
+    } | Sort-Object)
+    [pscustomobject]@{ Protected = $acl.AreAccessRulesProtected; Rules = $rules } | ConvertTo-Json -Compress
+}
 try {
     . (Join-Path $root 'co937.ps1')
     Assert-True ($script:handler.Invoke('Get-Date') -eq 'MemoryOnly') 'delegate result preserved'
@@ -44,7 +55,7 @@ try {
     $hashMethod = $hashType.GetMethod('ComputeHash', [Reflection.BindingFlags]'Static,NonPublic')
     $hashPath = $script:historyPath
     if (Test-Co937IsWindows) { $hashPath = $hashPath.ToLower() }
-    $expectedMutex = 'PSReadLineHistoryFile_' + $hashMethod.Invoke($null, @($hashPath)).ToString()
+    $expectedMutex = 'PSReadLineHistoryFile_' + $hashMethod.Invoke($null, @([string]$hashPath)).ToString()
     Assert-True ((Get-Co937HistoryMutexName $script:historyPath) -eq $expectedMutex) 'mutex matches PSReadLine'
 
     $tokens = $null; $parseErrors = $null
@@ -58,17 +69,35 @@ try {
     Assert-True (-not (($preview | Out-String) -cmatch '\[2\] token')) 'default preview hides command contents'
     $sensitivePreview = @(Remove-PSReadLineHistoryLine -Contains token -ShowSensitivePreview -WhatIf -Confirm:$false 6>&1)
     Assert-True (($sensitivePreview | Out-String) -cmatch '\[2\] token') 'explicit preview shows contents'
-    if (Test-Co937IsWindows) {
-        $permissionsBefore = (Get-Acl -LiteralPath $script:historyPath).GetSecurityDescriptorSddlForm([Security.AccessControl.AccessControlSections]::Access)
-    } else { $permissionsBefore = [IO.File]::GetUnixFileMode($script:historyPath) }
+    $permissionsBefore = Get-FixturePermissions
     $result = Remove-PSReadLineHistoryLine -Contains token -Force -Confirm:$false
     Assert-True ($result.RemovedCount -eq 1 -and (Get-Fixture) -ceq "TOKEN`nkeep`n") 'only case-sensitive match removed'
-    if (Test-Co937IsWindows) {
-        $permissionsAfter = (Get-Acl -LiteralPath $script:historyPath).GetSecurityDescriptorSddlForm([Security.AccessControl.AccessControlSections]::Access)
-    } else { $permissionsAfter = [IO.File]::GetUnixFileMode($script:historyPath) }
+    $permissionsAfter = Get-FixturePermissions
     Assert-True ($permissionsBefore -eq $permissionsAfter) 'file permissions preserved'
     $result = Remove-PSReadLineHistoryLine -Contains token -IgnoreCase -Force -Confirm:$false
     Assert-True ((Get-Fixture) -ceq "keep`n") 'ignore-case removal'
+
+    if (Test-Co937IsWindows) {
+        # Reproduce Windows DACL normalization using a protected, explicitly assigned ACL.
+        $originalPath = $script:historyPath
+        $script:historyPath = Join-Path $testDirectory 'protected-history.txt'
+        try {
+            $acl = [Security.AccessControl.FileSecurity]::new()
+            $acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new(
+                [Security.Principal.WindowsIdentity]::GetCurrent().User, 'FullControl', 'Allow'))
+            $acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new(
+                [Security.Principal.SecurityIdentifier]::new('S-1-1-0'), 'ExecuteFile', 'Deny'))
+            $stream = [IO.FileSystemAclExtensions]::Create([IO.FileInfo]::new($script:historyPath),
+                [IO.FileMode]::CreateNew, [Security.AccessControl.FileSystemRights]::Write,
+                [IO.FileShare]::None, 4096, [IO.FileOptions]::None, $acl)
+            $stream.Dispose()
+            Set-Fixture "secret`nkeep`n"
+            $permissionsBefore = Get-FixturePermissions
+            $result = Remove-PSReadLineHistoryLine -Exact secret -Force -Confirm:$false
+            Assert-True ((Get-Fixture) -ceq "keep`n") 'protected history removal'
+            Assert-True ($permissionsBefore -ceq (Get-FixturePermissions)) 'protected allow and deny rules preserved'
+        } finally { $script:historyPath = $originalPath }
+    }
 
     $command = "Write-Output 'α'`nWrite-Output 'secret'"
     $serialized = $command.Replace("`n", ([string][char]96 + [char]10)) + "`n"
