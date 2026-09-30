@@ -218,6 +218,9 @@ function Write-Co937HistoryAtomically {
                 [IO.FileInfo]::new($temporaryPath), [IO.FileMode]::CreateNew,
                 [Security.AccessControl.FileSystemRights]::Write, [IO.FileShare]::None,
                 4096, [IO.FileOptions]::None, $accessRules)
+            # Creation can materialize inherited rules as explicit rules on Windows.
+            # Reapply the source DACL before writing any history to avoid duplicated grants.
+            [IO.FileSystemAclExtensions]::SetAccessControl([IO.FileInfo]::new($temporaryPath), $accessRules)
         } else {
             $stream = [IO.File]::Open($temporaryPath, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
             [IO.File]::SetUnixFileMode($temporaryPath, [IO.File]::GetUnixFileMode($Path))
