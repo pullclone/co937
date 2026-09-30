@@ -73,7 +73,7 @@ try {
     $result = Remove-PSReadLineHistoryLine -Contains token -Force -Confirm:$false
     Assert-True ($result.RemovedCount -eq 1 -and (Get-Fixture) -ceq "TOKEN`nkeep`n") 'only case-sensitive match removed'
     $permissionsAfter = Get-FixturePermissions
-    Assert-True ($permissionsBefore -eq $permissionsAfter) 'file permissions preserved'
+    Assert-True ($permissionsBefore -eq $permissionsAfter) "file permissions preserved; before: $permissionsBefore; after: $permissionsAfter"
     $result = Remove-PSReadLineHistoryLine -Contains token -IgnoreCase -Force -Confirm:$false
     Assert-True ((Get-Fixture) -ceq "keep`n") 'ignore-case removal'
 
